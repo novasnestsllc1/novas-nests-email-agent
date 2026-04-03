@@ -2,7 +2,7 @@ const express = require('express');
 const app = express();
 app.use(express.json());
 
-const PORT = process.env.PORT || 3001;
+const PORT = process.env.PORT || 3000;
 const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
 const MONDAY_API_KEY = process.env.MONDAY_API_KEY;
 const MS_TENANT_ID = process.env.MS_TENANT_ID;
@@ -18,32 +18,33 @@ const CONTRACTS = {
     boardId: '18406634526',
     vaLocation: 'Portland VA Health Care System',
     keywords: ['portland', 'self-care lodging', 'fisher house', 'best western', '503-220-8262'],
-    notifiedColumnId: 'color_mm217f68'
+    notifiedColumnId: 'color_mm217f68',
+    hotel: 'Best Western',
+    statusColumnId: 'color_mm1d6vgs'
   },
   wrj: {
     name: 'WRJ VA Contract',
     boardId: '18403874769',
     vaLocation: 'White River Junction VA Medical Center',
     keywords: ['white river junction', 'vermont', 'wrj', 'vt '],
-    notifiedColumnId: 'color_mm21sgv8'
+    notifiedColumnId: 'color_mm21sgv8',
+    hotel: 'Comfort Inn',
+    statusColumnId: 'color_mm1d6vgs'
   },
   slc_heart: {
     name: 'Heart Transplant SLC VA Contract',
     boardId: '18406339737',
     vaLocation: 'Salt Lake City VA Medical Center',
     keywords: ['heart transplant', 'lvad', 'residence inn', 'salt lake', 'slc'],
-    notifiedColumnId: null // will be created
+    notifiedColumnId: null,
+    hotel: 'Residence Inn',
+    statusColumnId: 'color_mm1d6vgs'
   },
-  hoptel: {
-    name: 'Hoptel SLC',
-    boardId: '18406338444',
-    vaLocation: 'Salt Lake City VA Medical Center',
-    keywords: ['crystal inn', 'hoptel', 'west valley', 'offsite va master'],
-    notifiedColumnId: null // excel based, different flow
-  }
+  // Hoptel SLC is handled manually — Excel spreadsheet workflow
+  // not compatible with automated item creation. Team processes manually.
 };
 
-// Shared Monday column IDs (same across all boards)
+// Shared Monday column IDs
 const COLS = {
   phone:    'phone_mm1rs0ge',
   hotel:    'color_mm1dtr12',
@@ -59,6 +60,17 @@ function log(msg) {
   console.log(`[${new Date().toISOString()}] ${msg}`);
 }
 
+// ─── Phone formatting — always +1 ────────────────────────────────────────────
+
+function formatPhone(rawPhone) {
+  if (!rawPhone) return null;
+  const digits = String(rawPhone).replace(/\D/g, '');
+  if (digits.length === 10) return '+1' + digits;
+  if (digits.length === 11 && digits.startsWith('1')) return '+' + digits;
+  if (digits.length > 10) return '+1' + digits.slice(-10);
+  return null;
+}
+
 // ─── Microsoft Graph API ──────────────────────────────────────────────────────
 
 let msToken = null;
@@ -66,7 +78,6 @@ let msTokenExpiry = 0;
 
 async function getMSToken() {
   if (msToken && Date.now() < msTokenExpiry) return msToken;
-
   const resp = await fetch(
     `https://login.microsoftonline.com/${MS_TENANT_ID}/oauth2/v2.0/token`,
     {
@@ -80,8 +91,8 @@ async function getMSToken() {
       })
     }
   );
-
   const data = await resp.json();
+  if (!data.access_token) throw new Error(`MS Auth failed: ${JSON.stringify(data)}`);
   msToken = data.access_token;
   msTokenExpiry = Date.now() + (data.expires_in - 60) * 1000;
   return msToken;
@@ -113,119 +124,159 @@ async function markEmailAsRead(emailId) {
     `https://graph.microsoft.com/v1.0/users/${RESERVATIONS_EMAIL}/messages/${emailId}`,
     {
       method: 'PATCH',
-      headers: {
-        Authorization: `Bearer ${token}`,
-        'Content-Type': 'application/json'
-      },
+      headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
       body: JSON.stringify({ isRead: true })
     }
   );
 }
 
-// ─── Claude AI Extraction ─────────────────────────────────────────────────────
+// ─── Attachment extraction ────────────────────────────────────────────────────
 
-async function extractWithClaude(content, contentType, contractHint) {
-  const systemPrompt = `You are a VA reservation data extraction specialist for Nova's Nests LLC, a veteran-owned federal lodging broker.
+function extractTextFromAttachment(att) {
+  const name = (att.name || '').toLowerCase();
+  if (att.contentBytes) {
+    const mediaType = name.endsWith('.pdf') ? 'application/pdf'
+      : (name.endsWith('.docx') || name.endsWith('.doc'))
+        ? 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
+        : null;
+    if (mediaType) return { type: 'document', mediaType, data: att.contentBytes, name: att.name };
+  }
+  if (att.body?.content) return { type: 'text', content: att.body.content, name: att.name };
+  return null;
+}
 
-Extract reservation data from the provided content and return ONLY a JSON array of reservation objects. No explanation, no markdown, just the JSON array.
+// ─── Claude AI ────────────────────────────────────────────────────────────────
 
-Each reservation object must have these fields (use null if not found):
+async function callClaude(messages, systemPrompt, maxTokens = 2000) {
+  const resp = await fetch('https://api.anthropic.com/v1/messages', {
+    method: 'POST',
+    headers: {
+      'x-api-key': ANTHROPIC_API_KEY,
+      'anthropic-version': '2023-06-01',
+      'Content-Type': 'application/json'
+    },
+    body: JSON.stringify({
+      model: 'claude-sonnet-4-20250514',
+      max_tokens: maxTokens,
+      system: systemPrompt,
+      messages
+    })
+  });
+  if (!resp.ok) {
+    const err = await resp.json();
+    throw new Error(`Claude API error: ${err.error?.message || JSON.stringify(err)}`);
+  }
+  const data = await resp.json();
+  return data.content?.[0]?.text || '';
+}
+
+async function classifyEmail(emailSubject, emailBody) {
+  // Determine if email is: new_reservation, cancellation, extension, or other
+  const text = await callClaude([{
+    role: 'user',
+    content: `Classify this VA lodging email. Reply with ONLY one word:
+- new_reservation: new booking request
+- cancellation: veteran cancelling or no longer needs lodging
+- extension: extending an existing stay (later checkout date)
+- update: change to existing reservation (different dates, room type, etc.)
+- other: not a reservation email
+
+Subject: ${emailSubject}
+Body excerpt: ${emailBody.substring(0, 800)}`
+  }], 'You classify VA lodging emails. Reply with only one word.', 50);
+
+  const result = text.trim().toLowerCase();
+  const valid = ['new_reservation', 'cancellation', 'extension', 'update', 'other'];
+  return valid.includes(result) ? result : 'other';
+}
+
+async function identifyContract(emailSubject, emailBody, attachmentNames) {
+  const combined = `${emailSubject} ${emailBody} ${attachmentNames.join(' ')}`.toLowerCase();
+  for (const [key, contract] of Object.entries(CONTRACTS)) {
+    for (const keyword of contract.keywords) {
+      if (combined.includes(keyword.toLowerCase())) return key;
+    }
+  }
+  const result = await callClaude([{
+    role: 'user',
+    content: `Which VA contract? Reply with ONLY one word: portland, wrj, slc_heart, hoptel, or unknown
+
+Subject: ${emailSubject}
+Body: ${emailBody.substring(0, 500)}
+Attachments: ${attachmentNames.join(', ')}
+
+- portland: Portland Oregon VA, Self-Care Lodging, Best Western, 503 area code
+- wrj: White River Junction Vermont VA, 802 area code
+- slc_heart: Salt Lake City Heart Transplant or LVAD, Residence Inn, flight info
+- hoptel: Crystal Inn, West Valley, Hoptel, Excel spreadsheet — NOTE: reply "hoptel" so agent can skip it`
+  }], 'You identify VA contracts. Reply with only one word.', 20);
+
+  const r = result.trim().toLowerCase();
+  return ['portland', 'wrj', 'slc_heart', 'hoptel'].includes(r) ? r : 'unknown';
+}
+
+async function extractReservations(emailSubject, emailBody, contractKey, attachments, emailType) {
+  const contract = CONTRACTS[contractKey] || { name: 'Unknown' };
+
+  const systemPrompt = `You are a VA reservation data extraction specialist for Nova's Nests LLC.
+
+Extract ALL reservations and return ONLY a valid JSON array. No explanation, no markdown, just raw JSON.
+
+Each object must have exactly these fields (null if not found):
 {
-  "veteran_name": "First Last format",
-  "veteran_phone": "digits only, no formatting",
+  "veteran_name": "First Last — convert Last, First to First Last",
+  "veteran_phone": "10 digits only, no formatting, no country code, no +1",
   "checkin_date": "YYYY-MM-DD",
   "checkout_date": "YYYY-MM-DD",
   "num_guests": number or null,
   "hotel_confirmation": "string or null",
   "room_type": "string or null",
-  "special_notes": "any special requests, ADA, oxygen, service dog, etc or null",
+  "special_notes": "ADA, oxygen, service dog, ground floor, medical companion, etc or null",
   "caregiver_name": "string or null",
-  "caregiver_phone": "digits only or null",
-  "flight_info": "string or null"
+  "caregiver_phone": "10 digits only or null",
+  "flight_info": "all flight details as one string or null"
 }
 
-Content type: ${contentType}
-Contract hint: ${contractHint}
+Contract: ${contract.name}
+Email type: ${emailType}
 
 Rules:
-- If veteran name is in "Last, First" format, convert to "First Last"
-- Extract ALL veterans if multiple are in one email
-- For SLC Heart Transplant emails with a table, extract each row as a separate reservation
-- For Hoptel Excel content, extract each veteran row as a separate reservation
-- Phone numbers: strip all non-digits, if 11 digits starting with 1 strip the leading 1
+- Convert Last, First → First Last
+- Extract EVERY veteran if multiple appear
+- Phone: strip all non-digits, remove leading 1 if 11 digits
 - Dates: convert any format to YYYY-MM-DD
-- Return empty array [] if no valid reservations found`;
+- Return [] if no valid reservations found`;
 
-  const resp = await fetch('https://api.anthropic.com/v1/messages', {
-    method: 'POST',
-    headers: {
-      'x-api-key': ANTHROPIC_API_KEY,
-      'anthropic-version': '2023-06-01',
-      'Content-Type': 'application/json'
-    },
-    body: JSON.stringify({
-      model: 'claude-sonnet-4-20250514',
-      max_tokens: 2000,
-      system: systemPrompt,
-      messages: [{ role: 'user', content: `Extract reservations from this content:\n\n${content}` }]
-    })
-  });
+  const messageContent = [];
 
-  const data = await resp.json();
-  const text = data.content?.[0]?.text || '[]';
-
-  try {
-    const clean = text.replace(/```json|```/g, '').trim();
-    return JSON.parse(clean);
-  } catch (e) {
-    log(`⚠ Claude extraction parse error: ${e.message}`);
-    return [];
-  }
-}
-
-async function identifyContract(emailSubject, emailBody, attachmentNames) {
-  const combined = `${emailSubject} ${emailBody} ${attachmentNames.join(' ')}`.toLowerCase();
-
-  // Check each contract's keywords
-  for (const [key, contract] of Object.entries(CONTRACTS)) {
-    for (const keyword of contract.keywords) {
-      if (combined.includes(keyword.toLowerCase())) {
-        return key;
-      }
+  // Include document attachments
+  for (const att of attachments) {
+    if (att.type === 'document') {
+      log(`📎 Sending ${att.name} to Claude as document`);
+      messageContent.push({
+        type: 'document',
+        source: { type: 'base64', media_type: att.mediaType, data: att.data }
+      });
     }
   }
 
-  // If unclear, ask Claude
-  const resp = await fetch('https://api.anthropic.com/v1/messages', {
-    method: 'POST',
-    headers: {
-      'x-api-key': ANTHROPIC_API_KEY,
-      'anthropic-version': '2023-06-01',
-      'Content-Type': 'application/json'
-    },
-    body: JSON.stringify({
-      model: 'claude-sonnet-4-20250514',
-      max_tokens: 100,
-      messages: [{
-        role: 'user',
-        content: `Which VA contract is this email for? Reply with ONLY one of: portland, wrj, slc_heart, hoptel, unknown
-
-Email subject: ${emailSubject}
-Email body excerpt: ${emailBody.substring(0, 500)}
-Attachments: ${attachmentNames.join(', ')}
-
-Contracts:
-- portland: Portland Oregon VA Health Care System, Self-Care Lodging, Best Western
-- wrj: White River Junction Vermont VA Medical Center
-- slc_heart: Salt Lake City Heart Transplant/LVAD, Residence Inn
-- hoptel: Salt Lake City Crystal Inn West Valley or SLC, Hoptel, Excel spreadsheet`
-      }]
-    })
+  const cleanBody = emailBody.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
+  messageContent.push({
+    type: 'text',
+    text: `Subject: ${emailSubject}\n\nBody:\n${cleanBody.substring(0, 3000)}\n\nExtract all VA reservations.`
   });
 
-  const data = await resp.json();
-  const result = data.content?.[0]?.text?.trim().toLowerCase() || 'unknown';
-  return ['portland', 'wrj', 'slc_heart', 'hoptel'].includes(result) ? result : 'unknown';
+  const text = await callClaude(
+    [{ role: 'user', content: messageContent }],
+    systemPrompt
+  );
+
+  try {
+    return JSON.parse(text.replace(/```json|```/g, '').trim());
+  } catch (e) {
+    log(`⚠ Parse error: ${e.message} — Raw: ${text.substring(0, 200)}`);
+    return [];
+  }
 }
 
 // ─── Monday API ───────────────────────────────────────────────────────────────
@@ -243,33 +294,96 @@ async function mondayQuery(query) {
   return resp.json();
 }
 
-async function createMondayItem(boardId, veteranName, reservation, hotelName) {
-  const columnValues = {
+async function findExistingItem(boardId, veteranName, checkinDate) {
+  // Search board for matching veteran + checkin date
+  const query = `
+    query {
+      boards(ids: [${boardId}]) {
+        items_page(limit: 200) {
+          items {
+            id
+            name
+            column_values(ids: ["${COLS.checkin}", "${COLS.checkout}", "${COLS.status}"]) {
+              id
+              text
+            }
+          }
+        }
+      }
+    }
+  `;
+  const result = await mondayQuery(query);
+  const items = result?.data?.boards?.[0]?.items_page?.items || [];
+
+  // Match on first name + checkin date for robustness
+  const firstName = veteranName.toLowerCase().split(' ')[0];
+
+  return items.find(item => {
+    const nameMatch = item.name.toLowerCase().includes(firstName);
+    const checkinCol = item.column_values?.find(c => c.id === COLS.checkin);
+    const dateMatch = checkinDate ? checkinCol?.text === checkinDate : true;
+    return nameMatch && dateMatch;
+  }) || null;
+}
+
+async function findExistingItemByName(boardId, veteranName) {
+  // Find by name only — for cancellations where we may not have the exact date
+  const query = `
+    query {
+      boards(ids: [${boardId}]) {
+        items_page(limit: 200) {
+          items {
+            id
+            name
+            column_values(ids: ["${COLS.checkin}", "${COLS.checkout}", "${COLS.status}"]) {
+              id
+              text
+            }
+          }
+        }
+      }
+    }
+  `;
+  const result = await mondayQuery(query);
+  const items = result?.data?.boards?.[0]?.items_page?.items || [];
+  const firstName = veteranName.toLowerCase().split(' ')[0];
+  const lastName = veteranName.toLowerCase().split(' ').slice(-1)[0];
+
+  // Return most recently created match
+  return items.find(item => {
+    const nameLower = item.name.toLowerCase();
+    return nameLower.includes(firstName) || nameLower.includes(lastName);
+  }) || null;
+}
+
+async function createMondayItem(boardId, veteranName, reservation, contract) {
+  const phone = formatPhone(reservation.veteran_phone);
+
+  const colValues = {
     [COLS.status]: { label: 'Working on it' }
   };
 
-  if (reservation.veteran_phone) columnValues[COLS.phone] = reservation.veteran_phone;
-  if (reservation.checkin_date) columnValues[COLS.checkin] = { date: reservation.checkin_date };
-  if (reservation.checkout_date) columnValues[COLS.checkout] = { date: reservation.checkout_date };
-  if (reservation.num_guests) columnValues[COLS.guests] = reservation.num_guests;
-  if (reservation.hotel_confirmation) columnValues[COLS.confirm] = reservation.hotel_confirmation;
-  if (hotelName) columnValues[COLS.hotel] = { label: hotelName };
+  if (phone) colValues[COLS.phone] = phone;
+  if (reservation.checkin_date) colValues[COLS.checkin] = { date: reservation.checkin_date };
+  if (reservation.checkout_date) colValues[COLS.checkout] = { date: reservation.checkout_date };
+  if (reservation.num_guests) colValues[COLS.guests] = reservation.num_guests;
+  if (reservation.hotel_confirmation) colValues[COLS.confirm] = reservation.hotel_confirmation;
+  if (contract.hotel) colValues[COLS.hotel] = { label: contract.hotel };
 
-  // Build notes from special fields
   const notesParts = [];
   if (reservation.special_notes) notesParts.push(reservation.special_notes);
   if (reservation.caregiver_name) notesParts.push(`Caregiver: ${reservation.caregiver_name}`);
-  if (reservation.caregiver_phone) notesParts.push(`Caregiver Ph: ${reservation.caregiver_phone}`);
+  if (reservation.caregiver_phone) notesParts.push(`Caregiver Ph: +1${reservation.caregiver_phone}`);
   if (reservation.flight_info) notesParts.push(`Flight: ${reservation.flight_info}`);
   if (reservation.room_type) notesParts.push(`Room: ${reservation.room_type}`);
-  if (notesParts.length > 0) columnValues[COLS.notes] = notesParts.join(' | ');
+  if (notesParts.length > 0) colValues[COLS.notes] = notesParts.join(' | ');
 
   const mutation = `
     mutation {
       create_item(
         board_id: ${boardId},
         item_name: "${veteranName.replace(/"/g, '\\"')}",
-        column_values: ${JSON.stringify(JSON.stringify(columnValues))}
+        column_values: ${JSON.stringify(JSON.stringify(colValues))}
       ) { id name }
     }
   `;
@@ -278,169 +392,288 @@ async function createMondayItem(boardId, veteranName, reservation, hotelName) {
   return result?.data?.create_item;
 }
 
-async function checkDuplicateItem(boardId, veteranName, checkinDate) {
-  const query = `
-    query {
-      boards(ids: [${boardId}]) {
-        items_page(limit: 100) {
-          items {
-            id
-            name
-            column_values(ids: ["${COLS.checkin}"]) { text }
-          }
-        }
-      }
+async function cancelMondayItem(boardId, itemId, veteranName) {
+  // Set status to Stuck (closest to cancelled on existing boards)
+  // Note: "Stuck" is index 2 on all boards
+  const colValues = { [COLS.status]: { label: 'Stuck' } };
+  const mutation = `
+    mutation {
+      change_multiple_column_values(
+        board_id: ${boardId},
+        item_id: ${itemId},
+        column_values: ${JSON.stringify(JSON.stringify(colValues))}
+      ) { id name }
     }
   `;
-
-  const result = await mondayQuery(query);
-  const items = result?.data?.boards?.[0]?.items_page?.items || [];
-
-  return items.some(item => {
-    const nameMatch = item.name.toLowerCase().includes(veteranName.toLowerCase().split(' ')[0].toLowerCase());
-    const dateMatch = item.column_values?.[0]?.text === checkinDate;
-    return nameMatch && dateMatch;
-  });
+  const result = await mondayQuery(mutation);
+  log(`✓ Marked ${veteranName} as Stuck/Cancelled (item ${itemId})`);
+  return result?.data?.change_multiple_column_values;
 }
 
-// ─── Main Email Processor ─────────────────────────────────────────────────────
+async function extendMondayItem(boardId, itemId, newCheckoutDate, veteranName) {
+  const colValues = {
+    [COLS.checkout]: { date: newCheckoutDate },
+    [COLS.status]: { label: 'Working on it' }
+  };
+  const mutation = `
+    mutation {
+      change_multiple_column_values(
+        board_id: ${boardId},
+        item_id: ${itemId},
+        column_values: ${JSON.stringify(JSON.stringify(colValues))}
+      ) { id name }
+    }
+  `;
+  const result = await mondayQuery(mutation);
+  log(`✓ Extended ${veteranName} checkout to ${newCheckoutDate} (item ${itemId})`);
+  return result?.data?.change_multiple_column_values;
+}
+
+async function updateMondayItem(boardId, itemId, reservation, veteranName) {
+  const colValues = {};
+  if (reservation.checkin_date) colValues[COLS.checkin] = { date: reservation.checkin_date };
+  if (reservation.checkout_date) colValues[COLS.checkout] = { date: reservation.checkout_date };
+  if (reservation.hotel_confirmation) colValues[COLS.confirm] = reservation.hotel_confirmation;
+  if (reservation.num_guests) colValues[COLS.guests] = reservation.num_guests;
+  colValues[COLS.status] = { label: 'Working on it' };
+
+  const mutation = `
+    mutation {
+      change_multiple_column_values(
+        board_id: ${boardId},
+        item_id: ${itemId},
+        column_values: ${JSON.stringify(JSON.stringify(colValues))}
+      ) { id name }
+    }
+  `;
+  const result = await mondayQuery(mutation);
+  log(`✓ Updated ${veteranName} reservation (item ${itemId})`);
+  return result?.data?.change_multiple_column_values;
+}
+
+// ─── Main email processor ─────────────────────────────────────────────────────
 
 async function processEmail(email) {
   log(`📧 Processing: "${email.subject}" from ${email.from?.emailAddress?.address}`);
 
   const emailBody = email.body?.content || '';
-  // Strip HTML tags for cleaner text
   const cleanBody = emailBody.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
 
-  // Get attachments if any
-  let attachments = [];
+  // Get attachments
+  let processedAttachments = [];
   let attachmentNames = [];
-  let attachmentContent = '';
 
   if (email.hasAttachments) {
-    attachments = await getEmailAttachments(email.id);
-    attachmentNames = attachments.map(a => a.name || '');
-
-    for (const att of attachments) {
-      const name = (att.name || '').toLowerCase();
-      // Process PDF, DOCX, XLSX, TXT attachments
-      if (name.endsWith('.pdf') || name.endsWith('.docx') || name.endsWith('.doc')) {
-        // For Word/PDF - use the text content if available
-        if (att.contentBytes) {
-          attachmentContent += `\n[Attachment: ${att.name}]\n`;
-          // Note: Binary content - Claude will use email body context
-          // Full PDF/DOCX parsing would require additional libraries on server
+    try {
+      const attachments = await getEmailAttachments(email.id);
+      attachmentNames = attachments.map(a => a.name || '');
+      for (const att of attachments) {
+        const extracted = extractTextFromAttachment(att);
+        if (extracted) {
+          processedAttachments.push(extracted);
+          log(`📎 Attachment: ${att.name} (${extracted.type})`);
         }
-      } else if (name.endsWith('.xlsx') || name.endsWith('.xls')) {
-        attachmentContent += `\n[Excel attachment: ${att.name} - process as Hoptel SLC spreadsheet]\n`;
-      } else if (att.body?.content) {
-        attachmentContent += `\n[Attachment: ${att.name}]\n${att.body.content}`;
       }
+    } catch (e) {
+      log(`⚠ Could not read attachments: ${e.message} — continuing with email body`);
     }
   }
 
-  // Identify which contract this is for
-  const contractKey = await identifyContract(email.subject, cleanBody, attachmentNames);
+  // Step 1: Classify email type
+  let emailType;
+  try {
+    emailType = await classifyEmail(email.subject, cleanBody);
+    log(`📋 Email type: ${emailType}`);
+  } catch (e) {
+    log(`✗ Classification failed: ${e.message} — leaving UNREAD`);
+    return;
+  }
+
+  if (emailType === 'other') {
+    log(`ℹ Not a reservation email — leaving UNREAD for manual review`);
+    return;
+  }
+
+  // Step 2: Identify contract
+  let contractKey;
+  try {
+    contractKey = await identifyContract(email.subject, cleanBody, attachmentNames);
+  } catch (e) {
+    log(`✗ Contract ID failed: ${e.message} — leaving UNREAD`);
+    return;
+  }
 
   if (contractKey === 'unknown') {
-    log(`⚠ Could not identify contract for email: "${email.subject}" — skipping`);
-    await markEmailAsRead(email.id);
+    log(`⚠ Unknown contract: "${email.subject}" — leaving UNREAD for manual review`);
+    return;
+  }
+
+  // Hoptel is manual — leave unread for team to process
+  if (contractKey === 'hoptel') {
+    log(`📋 Hoptel SLC email detected: "${email.subject}" — leaving UNREAD for manual processing`);
     return;
   }
 
   const contract = CONTRACTS[contractKey];
-  log(`✓ Identified contract: ${contract.name}`);
+  log(`✓ Contract: ${contract.name}`);
 
-  // Build full content for Claude
-  const fullContent = `
-Subject: ${email.subject}
-From: ${email.from?.emailAddress?.address}
-Body: ${cleanBody}
-${attachmentContent}
-  `.trim();
-
-  // Extract reservations with Claude
-  const reservations = await extractWithClaude(fullContent, 'email', contract.name);
-
-  if (reservations.length === 0) {
-    log(`⚠ No reservations extracted from email: "${email.subject}"`);
-    await markEmailAsRead(email.id);
+  // Step 3: Extract reservation data
+  let reservations = [];
+  try {
+    log(`🤖 Extracting with Claude (${emailType})...`);
+    reservations = await extractReservations(email.subject, cleanBody, contractKey, processedAttachments, emailType);
+  } catch (e) {
+    log(`✗ Extraction failed: ${e.message} — leaving UNREAD`);
     return;
   }
 
-  log(`✓ Extracted ${reservations.length} reservation(s)`);
+  if (reservations.length === 0) {
+    log(`⚠ No reservations extracted — leaving UNREAD for manual review`);
+    return;
+  }
 
-  // Determine hotel name from contract
-  let hotelName = null;
-  if (contractKey === 'portland') hotelName = 'Best Western';
-  else if (contractKey === 'wrj') hotelName = 'Comfort Inn';
-  else if (contractKey === 'slc_heart') hotelName = 'Residence Inn';
-  else if (contractKey === 'hoptel') hotelName = 'Crystal Inn';
+  log(`✓ Extracted ${reservations.length} reservation(s) — type: ${emailType}`);
 
-  // Create Monday items for each reservation
   let created = 0;
+  let updated = 0;
+  let cancelled = 0;
   let skipped = 0;
+  let failed = 0;
 
   for (const res of reservations) {
-    if (!res.veteran_name || !res.checkin_date) {
-      log(`⚠ Skipping incomplete reservation: ${JSON.stringify(res)}`);
+    if (!res.veteran_name) {
+      log(`⚠ No veteran name — skipping`);
       skipped++;
       continue;
     }
 
-    // Check for duplicate
-    const isDuplicate = await checkDuplicateItem(contract.boardId, res.veteran_name, res.checkin_date);
-    if (isDuplicate) {
-      log(`⏭ Duplicate found for ${res.veteran_name} on ${res.checkin_date} — skipping`);
-      skipped++;
-      continue;
-    }
+    try {
+      // ── CANCELLATION ──────────────────────────────────────────────────────
+      if (emailType === 'cancellation') {
+        const existing = await findExistingItemByName(contract.boardId, res.veteran_name);
+        if (existing) {
+          await cancelMondayItem(contract.boardId, existing.id, res.veteran_name);
+          log(`🚫 Cancelled: ${res.veteran_name} (item ${existing.id})`);
+          cancelled++;
+        } else {
+          log(`⚠ No existing item found for cancellation: ${res.veteran_name} — leaving UNREAD`);
+          failed++;
+        }
+        continue;
+      }
 
-    const item = await createMondayItem(contract.boardId, res.veteran_name, res, hotelName);
-    if (item) {
-      log(`✓ Created Monday item: ${item.name} (ID: ${item.id}) on ${contract.name}`);
-      created++;
+      // ── EXTENSION ─────────────────────────────────────────────────────────
+      if (emailType === 'extension') {
+        const existing = await findExistingItem(contract.boardId, res.veteran_name, res.checkin_date)
+          || await findExistingItemByName(contract.boardId, res.veteran_name);
+
+        if (existing && res.checkout_date) {
+          await extendMondayItem(contract.boardId, existing.id, res.checkout_date, res.veteran_name);
+          log(`📅 Extended: ${res.veteran_name} → checkout ${res.checkout_date}`);
+          updated++;
+        } else if (!existing) {
+          // Extension for reservation not yet in Monday — create it
+          log(`⚠ No existing item for extension — creating new item for ${res.veteran_name}`);
+          const item = await createMondayItem(contract.boardId, res.veteran_name, res, contract);
+          if (item) { created++; }
+        } else {
+          log(`⚠ Extension found existing but no checkout date — skipping ${res.veteran_name}`);
+          skipped++;
+        }
+        continue;
+      }
+
+      // ── UPDATE ────────────────────────────────────────────────────────────
+      if (emailType === 'update') {
+        const existing = await findExistingItem(contract.boardId, res.veteran_name, res.checkin_date)
+          || await findExistingItemByName(contract.boardId, res.veteran_name);
+
+        if (existing) {
+          await updateMondayItem(contract.boardId, existing.id, res, res.veteran_name);
+          log(`✏️ Updated: ${res.veteran_name} (item ${existing.id})`);
+          updated++;
+        } else {
+          // Not found — treat as new
+          log(`⚠ No existing item for update — creating new for ${res.veteran_name}`);
+          const item = await createMondayItem(contract.boardId, res.veteran_name, res, contract);
+          if (item) { created++; }
+        }
+        continue;
+      }
+
+      // ── NEW RESERVATION ───────────────────────────────────────────────────
+      if (!res.checkin_date) {
+        log(`⚠ No check-in date for ${res.veteran_name} — skipping`);
+        skipped++;
+        continue;
+      }
+
+      // Check for exact duplicate (same veteran + same checkin)
+      const existing = await findExistingItem(contract.boardId, res.veteran_name, res.checkin_date);
+      if (existing) {
+        log(`⏭ Duplicate: ${res.veteran_name} on ${res.checkin_date} — skipping`);
+        skipped++;
+        continue;
+      }
+
+      // Create new item
+      const item = await createMondayItem(contract.boardId, res.veteran_name, res, contract);
+      if (item) {
+        log(`✓ Created: ${item.name} (${item.id}) — phone: ${formatPhone(res.veteran_phone) || 'none'}`);
+        created++;
+      } else {
+        log(`✗ Monday create returned null for ${res.veteran_name}`);
+        failed++;
+      }
+
+    } catch (e) {
+      log(`✗ Error processing ${res.veteran_name}: ${e.message}`);
+      failed++;
     }
   }
 
-  log(`✓ Email processed — ${created} created, ${skipped} skipped`);
+  // Only mark as read if something succeeded
+  if (failed > 0 && created === 0 && updated === 0 && cancelled === 0) {
+    log(`✗ Nothing succeeded — leaving email UNREAD for manual review`);
+    return;
+  }
 
-  // Mark email as read
+  log(`✓ Complete — ${created} created, ${updated} updated, ${cancelled} cancelled, ${skipped} skipped, ${failed} failed`);
   await markEmailAsRead(email.id);
 }
 
 // ─── Polling ──────────────────────────────────────────────────────────────────
 
 async function pollEmails() {
-  log('📬 Checking reservations@novasnestsgov.com for new emails...');
-
+  log('📬 Checking for new emails...');
   try {
     const emails = await getUnreadEmails();
-
-    if (emails.length === 0) {
-      log('✓ No new emails');
-      return;
-    }
-
+    if (emails.length === 0) { log('✓ No new emails'); return; }
     log(`Found ${emails.length} unread email(s)`);
-
     for (const email of emails) {
       await processEmail(email);
-      await new Promise(r => setTimeout(r, 1000)); // brief pause between emails
+      await new Promise(r => setTimeout(r, 1000));
     }
-
   } catch (e) {
     log(`✗ Poll error: ${e.message}`);
   }
 }
 
 function startPolling() {
-  log('🔄 Starting email polling every 5 minutes...');
+  log('🔄 Email polling started — every 5 minutes');
   pollEmails();
   setInterval(pollEmails, 5 * 60 * 1000);
 }
 
 // ─── Routes ───────────────────────────────────────────────────────────────────
+
+app.post('/webhook', async (req, res) => {
+  if (req.body?.challenge) {
+    log('✓ Webhook challenge verified');
+    return res.json({ challenge: req.body.challenge });
+  }
+  res.json({ status: 'received' });
+});
 
 app.get('/', (req, res) => {
   res.json({
@@ -452,8 +685,8 @@ app.get('/', (req, res) => {
 });
 
 app.post('/run-manual', async (req, res) => {
-  res.json({ status: 'Manual email check started' });
-  log('▶ Manual email check triggered');
+  res.json({ status: 'Manual check started' });
+  log('▶ Manual run triggered');
   await pollEmails();
 });
 
@@ -461,7 +694,7 @@ app.post('/run-manual', async (req, res) => {
 
 app.listen(PORT, () => {
   log(`Nova's Nests Email Agent listening on port ${PORT}`);
-  log(`Monitoring: ${RESERVATIONS_EMAIL}`);
+  log(`Mailbox: ${RESERVATIONS_EMAIL}`);
   log(`Contracts: ${Object.values(CONTRACTS).map(c => c.name).join(', ')}`);
   startPolling();
 });
