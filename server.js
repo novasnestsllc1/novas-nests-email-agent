@@ -173,20 +173,30 @@ async function extractTextFromAttachment(att) {
 
   // PDF — send as native document to Claude
   if (att.contentBytes && name.endsWith('.pdf')) {
+    log(`📎 PDF: ${att.name} (${att.contentBytes.length} base64 chars)`);
     return { type: 'document', mediaType: 'application/pdf', data: att.contentBytes, name: att.name };
   }
 
-  // DOCX/DOC — extract raw text using mammoth then send as plain text to Claude
+  // DOCX/DOC — extract raw text using mammoth
   if (att.contentBytes && (name.endsWith('.docx') || name.endsWith('.doc'))) {
     try {
       const buffer = Buffer.from(att.contentBytes, 'base64');
+      // Check file header — valid DOCX (zip) starts with PK = 504b0304
+      const header = buffer.slice(0, 4).toString('hex');
+      log(`📎 DOCX: ${att.name} | size: ${buffer.length} bytes | header: ${header}`);
+
+      if (header !== '504b0304') {
+        log(`⚠ Attachment header is ${header} — not a valid DOCX. Likely still OME encrypted.`);
+        return { type: 'text', content: `[Encrypted Word doc: ${att.name} — OME encryption prevented reading. Veteran details must be entered manually.]`, name: att.name };
+      }
+
       const result = await mammoth.extractRawText({ buffer });
       const text = result.value || '';
-      log(`📎 Extracted ${text.length} chars from Word doc: ${att.name}`);
+      log(`📎 Extracted ${text.length} chars from ${att.name}`);
       return { type: 'text', content: text, name: att.name };
     } catch (e) {
-      log(`⚠ Could not extract text from ${att.name}: ${e.message}`);
-      return { type: 'text', content: `[Word document: ${att.name} — could not extract text]`, name: att.name };
+      log(`⚠ mammoth failed for ${att.name}: ${e.message}`);
+      return { type: 'text', content: `[Word document: ${att.name} — extraction failed]`, name: att.name };
     }
   }
 
