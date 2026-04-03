@@ -503,6 +503,8 @@ async function processEmail(email) {
     return;
   }
 
+  await new Promise(r => setTimeout(r, 3000)); // pause between Claude calls
+
   if (contractKey === 'unknown') {
     log(`⚠ Unknown contract: "${email.subject}" — leaving UNREAD for manual review`);
     return;
@@ -652,7 +654,7 @@ async function pollEmails() {
     log(`Found ${emails.length} unread email(s)`);
     for (const email of emails) {
       await processEmail(email);
-      await new Promise(r => setTimeout(r, 1000));
+      await new Promise(r => setTimeout(r, 15000)); // 15 second pause between emails to avoid rate limits
     }
   } catch (e) {
     log(`✗ Poll error: ${e.message}`);
