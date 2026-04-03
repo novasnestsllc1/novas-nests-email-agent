@@ -20,7 +20,7 @@ const CONTRACTS = {
     vaLocation: 'Portland VA Health Care System',
     keywords: ['portland', 'self-care lodging', 'fisher house', 'best western', '503-220-8262'],
     notifiedColumnId: 'color_mm217f68',
-    hotel: 'Best Western',
+    hotel: 'Best Western Portland West Beaverton',
     statusColumnId: 'color_mm1d6vgs'
   },
   wrj: {
