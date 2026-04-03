@@ -170,49 +170,99 @@ async function callClaude(messages, systemPrompt, maxTokens = 2000) {
   return data.content?.[0]?.text || '';
 }
 
-async function classifyEmail(emailSubject, emailBody) {
-  // Determine if email is: new_reservation, cancellation, extension, or other
+async function classifyEmail(emailSubject, emailBody, attachmentNames) {
+  // If email has a PDF or DOCX attachment it's almost certainly a reservation
+  const hasReservationAttachment = attachmentNames.some(name => {
+    const lower = name.toLowerCase();
+    return lower.endsWith('.pdf') || lower.endsWith('.docx') || lower.endsWith('.doc');
+  });
+
+  if (hasReservationAttachment) {
+    log(`📎 Reservation attachment detected — treating as new_reservation`);
+    return 'new_reservation';
+  }
+
+  // Check body for cancellation/extension keywords before calling Claude
+  const combined = `${emailSubject} ${emailBody}`.toLowerCase();
+
+  const cancellationWords = ['cancel', 'cancelled', 'cancellation', 'no longer needs', 'no show', 'no-show', 'will not be', 'won\'t be'];
+  const extensionWords = ['extend', 'extension', 'extended', 'stay longer', 'additional night', 'additional nights', 'extra night'];
+  const updateWords = ['update', 'change', 'modify', 'reschedule', 'rescheduled', 'correction', 'corrected'];
+  const reservationWords = ['reservation', 'lodging', 'check-in', 'check in', 'arrival', 'veteran', 'voucher', 'booking', 'hotel conf', 'ck in', 'ck out'];
+
+  if (cancellationWords.some(w => combined.includes(w))) return 'cancellation';
+  if (extensionWords.some(w => combined.includes(w))) return 'extension';
+  if (updateWords.some(w => combined.includes(w))) return 'update';
+  if (reservationWords.some(w => combined.includes(w))) return 'new_reservation';
+
+  // Ask Claude only if keywords didn't match
   const text = await callClaude([{
     role: 'user',
     content: `Classify this VA lodging email. Reply with ONLY one word:
-- new_reservation: new booking request
+- new_reservation: new booking request or lodging authorization
 - cancellation: veteran cancelling or no longer needs lodging
-- extension: extending an existing stay (later checkout date)
-- update: change to existing reservation (different dates, room type, etc.)
-- other: not a reservation email
+- extension: extending an existing stay
+- update: change to existing reservation
+- other: clearly not related to VA lodging at all
 
 Subject: ${emailSubject}
 Body excerpt: ${emailBody.substring(0, 800)}`
-  }], 'You classify VA lodging emails. Reply with only one word.', 50);
+  }], 'You classify VA lodging emails. When in doubt lean toward new_reservation. Reply with only one word.', 50);
 
   const result = text.trim().toLowerCase();
   const valid = ['new_reservation', 'cancellation', 'extension', 'update', 'other'];
-  return valid.includes(result) ? result : 'other';
+  return valid.includes(result) ? result : 'new_reservation'; // default to new_reservation if unclear
 }
 
-async function identifyContract(emailSubject, emailBody, attachmentNames) {
+async function identifyContract(emailSubject, emailBody, attachmentNames, attachments) {
   const combined = `${emailSubject} ${emailBody} ${attachmentNames.join(' ')}`.toLowerCase();
+
+  // Fast keyword matching first — no Claude call needed
   for (const [key, contract] of Object.entries(CONTRACTS)) {
     for (const keyword of contract.keywords) {
       if (combined.includes(keyword.toLowerCase())) return key;
     }
   }
-  const result = await callClaude([{
-    role: 'user',
-    content: `Which VA contract? Reply with ONLY one word: portland, wrj, slc_heart, hoptel, or unknown
 
-Subject: ${emailSubject}
-Body: ${emailBody.substring(0, 500)}
-Attachments: ${attachmentNames.join(', ')}
+  // Keywords didn't match — send to Claude including attachment content so it can read the doc
+  const messageContent = [];
 
-- portland: Portland Oregon VA, Self-Care Lodging, Best Western, 503 area code
-- wrj: White River Junction Vermont VA, 802 area code
-- slc_heart: Salt Lake City Heart Transplant or LVAD, Residence Inn, flight info
-- hoptel: Crystal Inn, West Valley, Hoptel, Excel spreadsheet — NOTE: reply "hoptel" so agent can skip it`
-  }], 'You identify VA contracts. Reply with only one word.', 20);
+  // Include document attachments for Claude to read and identify contract
+  for (const att of (attachments || [])) {
+    if (att.type === 'document') {
+      log(`📎 Using ${att.name} to identify contract`);
+      messageContent.push({
+        type: 'document',
+        source: { type: 'base64', media_type: att.mediaType, data: att.data }
+      });
+    }
+  }
+
+  messageContent.push({
+    type: 'text',
+    text: `Which VA contract is this email for? Reply with ONLY one word: portland, wrj, slc_heart, or unknown
+
+Email subject: ${emailSubject}
+Email body: ${emailBody.substring(0, 500)}
+Attachment names: ${attachmentNames.join(', ')}
+
+Contracts:
+- portland: Portland Oregon VA Health Care System, Self-Care Lodging, Best Western, 503 area code, Christine Morgan, Fisher House, SW US Veterans Hospital
+- wrj: White River Junction Vermont VA Medical Center, 802 area code, Comfort Inn
+- slc_heart: Salt Lake City Heart Transplant or LVAD, Residence Inn, flight info, caregiver, hotel conf number in table format
+- unknown: cannot determine from any content
+
+Read any attached documents carefully to identify which VA facility and contract this belongs to.`
+  });
+
+  const result = await callClaude(
+    [{ role: 'user', content: messageContent }],
+    'You identify which VA contract an email belongs to by reading the email and any attached documents. Reply with only one word: portland, wrj, slc_heart, or unknown.',
+    20
+  );
 
   const r = result.trim().toLowerCase();
-  return ['portland', 'wrj', 'slc_heart', 'hoptel'].includes(r) ? r : 'unknown';
+  return ['portland', 'wrj', 'slc_heart'].includes(r) ? r : 'unknown';
 }
 
 async function extractReservations(emailSubject, emailBody, contractKey, attachments, emailType) {
@@ -482,7 +532,7 @@ async function processEmail(email) {
   // Step 1: Classify email type
   let emailType;
   try {
-    emailType = await classifyEmail(email.subject, cleanBody);
+    emailType = await classifyEmail(email.subject, cleanBody, attachmentNames);
     log(`📋 Email type: ${emailType}`);
   } catch (e) {
     log(`✗ Classification failed: ${e.message} — leaving UNREAD`);
@@ -497,7 +547,7 @@ async function processEmail(email) {
   // Step 2: Identify contract
   let contractKey;
   try {
-    contractKey = await identifyContract(email.subject, cleanBody, attachmentNames);
+    contractKey = await identifyContract(email.subject, cleanBody, attachmentNames, processedAttachments);
   } catch (e) {
     log(`✗ Contract ID failed: ${e.message} — leaving UNREAD`);
     return;
