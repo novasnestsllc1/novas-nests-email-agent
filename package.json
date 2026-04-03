@@ -1,0 +1,15 @@
+{
+  "name": "novas-nests-email-agent",
+  "version": "1.0.0",
+  "description": "Nova's Nests — AI Email Agent for all VA contracts",
+  "main": "email_agent.js",
+  "scripts": {
+    "start": "node email_agent.js"
+  },
+  "dependencies": {
+    "express": "^4.18.2"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
