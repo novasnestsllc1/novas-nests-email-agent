@@ -82,13 +82,22 @@ function formatPhone(rawPhone) {
   return null;
 }
 
-// ─── Microsoft Graph API ──────────────────────────────────────────────────────
+// ─── Microsoft Graph API — Delegated Auth ────────────────────────────────────
 
 let msToken = null;
 let msTokenExpiry = 0;
+let currentRefreshToken = process.env.MS_REFRESH_TOKEN;
 
 async function getMSToken() {
+  // Return cached token if still valid
   if (msToken && Date.now() < msTokenExpiry) return msToken;
+
+  if (!currentRefreshToken) {
+    throw new Error('MS_REFRESH_TOKEN not set — run the OAuth setup tool first');
+  }
+
+  log('🔐 Refreshing Microsoft access token...');
+
   const resp = await fetch(
     `https://login.microsoftonline.com/${MS_TENANT_ID}/oauth2/v2.0/token`,
     {
@@ -97,42 +106,58 @@ async function getMSToken() {
       body: new URLSearchParams({
         client_id: MS_CLIENT_ID,
         client_secret: MS_CLIENT_SECRET,
-        scope: 'https://graph.microsoft.com/.default',
-        grant_type: 'client_credentials'
+        refresh_token: currentRefreshToken,
+        scope: 'https://graph.microsoft.com/Mail.Read https://graph.microsoft.com/Mail.ReadWrite offline_access',
+        grant_type: 'refresh_token'
       })
     }
   );
+
   const data = await resp.json();
-  if (!data.access_token) throw new Error(`MS Auth failed: ${JSON.stringify(data)}`);
+
+  if (!data.access_token) {
+    throw new Error(`MS Token refresh failed: ${JSON.stringify(data)}`);
+  }
+
+  // Microsoft may rotate the refresh token — always store the latest one
+  if (data.refresh_token) {
+    currentRefreshToken = data.refresh_token;
+    log('🔐 Refresh token rotated — using new token');
+  }
+
   msToken = data.access_token;
   msTokenExpiry = Date.now() + (data.expires_in - 60) * 1000;
+  log('✓ Microsoft access token refreshed');
   return msToken;
 }
 
 async function getUnreadEmails() {
   const token = await getMSToken();
+  // Use /me endpoint since we're now authenticated as the mailbox owner
   const resp = await fetch(
-    `https://graph.microsoft.com/v1.0/users/${RESERVATIONS_EMAIL}/messages?$filter=isRead eq false&$top=20&$select=id,subject,body,from,receivedDateTime,hasAttachments`,
+    `https://graph.microsoft.com/v1.0/me/messages?$filter=isRead eq false&$top=20&$select=id,subject,body,from,receivedDateTime,hasAttachments`,
     { headers: { Authorization: `Bearer ${token}` } }
   );
   const data = await resp.json();
+  if (data.error) throw new Error(`Graph API error: ${data.error.message}`);
   return data.value || [];
 }
 
 async function getEmailAttachments(emailId) {
   const token = await getMSToken();
   const resp = await fetch(
-    `https://graph.microsoft.com/v1.0/users/${RESERVATIONS_EMAIL}/messages/${emailId}/attachments`,
+    `https://graph.microsoft.com/v1.0/me/messages/${emailId}/attachments`,
     { headers: { Authorization: `Bearer ${token}` } }
   );
   const data = await resp.json();
+  if (data.error) throw new Error(`Graph API error: ${data.error.message}`);
   return data.value || [];
 }
 
 async function markEmailAsRead(emailId) {
   const token = await getMSToken();
   await fetch(
-    `https://graph.microsoft.com/v1.0/users/${RESERVATIONS_EMAIL}/messages/${emailId}`,
+    `https://graph.microsoft.com/v1.0/me/messages/${emailId}`,
     {
       method: 'PATCH',
       headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
@@ -198,104 +223,127 @@ async function callClaude(messages, systemPrompt, maxTokens = 2000) {
   return data.content?.[0]?.text || '';
 }
 
-async function classifyEmail(emailSubject, emailBody, attachmentNames) {
-  // If email has a PDF or DOCX attachment it's almost certainly a reservation
-  const hasReservationAttachment = attachmentNames.some(name => {
-    const lower = name.toLowerCase();
-    return lower.endsWith('.pdf') || lower.endsWith('.docx') || lower.endsWith('.doc');
-  });
-
-  if (hasReservationAttachment) {
-    log(`📎 Reservation attachment detected — treating as new_reservation`);
-    return 'new_reservation';
-  }
-
-  // Check body for cancellation/extension keywords before calling Claude
-  const combined = `${emailSubject} ${emailBody}`.toLowerCase();
-
-  const cancellationWords = ['cancel', 'cancelled', 'cancellation', 'no longer needs', 'no show', 'no-show', 'will not be', 'won\'t be'];
-  const extensionWords = ['extend', 'extension', 'extended', 'stay longer', 'additional night', 'additional nights', 'extra night'];
-  const updateWords = ['update', 'change', 'modify', 'reschedule', 'rescheduled', 'correction', 'corrected'];
-  const reservationWords = ['reservation', 'lodging', 'check-in', 'check in', 'arrival', 'veteran', 'voucher', 'booking', 'hotel conf', 'ck in', 'ck out'];
-
-  if (cancellationWords.some(w => combined.includes(w))) return 'cancellation';
-  if (extensionWords.some(w => combined.includes(w))) return 'extension';
-  if (updateWords.some(w => combined.includes(w))) return 'update';
-  if (reservationWords.some(w => combined.includes(w))) return 'new_reservation';
-
-  // Ask Claude only if keywords didn't match
-  const text = await callClaude([{
-    role: 'user',
-    content: `Classify this VA lodging email. Reply with ONLY one word:
-- new_reservation: new booking request or lodging authorization
-- cancellation: veteran cancelling or no longer needs lodging
-- extension: extending an existing stay
-- update: change to existing reservation
-- other: clearly not related to VA lodging at all
-
-Subject: ${emailSubject}
-Body excerpt: ${emailBody.substring(0, 800)}`
-  }], 'You classify VA lodging emails. When in doubt lean toward new_reservation. Reply with only one word.', 50);
-
-  const result = text.trim().toLowerCase();
-  const valid = ['new_reservation', 'cancellation', 'extension', 'update', 'other'];
-  return valid.includes(result) ? result : 'new_reservation'; // default to new_reservation if unclear
-}
-
-async function identifyContract(emailSubject, emailBody, attachmentNames, attachments) {
+async function classifyAndIdentify(emailSubject, emailBody, attachmentNames, attachments) {
+  // Fast keyword checks first — no Claude needed
   const combined = `${emailSubject} ${emailBody} ${attachmentNames.join(' ')}`.toLowerCase();
 
-  // Fast keyword matching first — no Claude call needed
-  for (const [key, contract] of Object.entries(CONTRACTS)) {
-    for (const keyword of contract.keywords) {
-      if (combined.includes(keyword.toLowerCase())) return key;
+  // Check for Hoptel first before any SLC matching
+  const hoptelKeywords = ['crystal inn', 'hoptel', 'west valley', 'offsite va master', 'crystalinns'];
+  if (hoptelKeywords.some(k => combined.includes(k))) {
+    return { emailType: 'new_reservation', contractKey: 'hoptel' };
+  }
+
+  // Cancellation/extension/update keywords
+  const cancellationWords = ['cancel', 'cancelled', 'cancellation', 'no longer needs', 'no show', 'no-show', 'will not be', "won't be"];
+  const extensionWords = ['extend', 'extension', 'extended', 'stay longer', 'additional night', 'additional nights', 'extra night'];
+  const updateWords = ['update', 'change', 'modify', 'reschedule', 'rescheduled', 'correction', 'corrected'];
+
+  let emailType = null;
+  if (cancellationWords.some(w => combined.includes(w))) emailType = 'cancellation';
+  else if (extensionWords.some(w => combined.includes(w))) emailType = 'extension';
+  else if (updateWords.some(w => combined.includes(w))) emailType = 'update';
+
+  // Contract keyword matching
+  const contractKeywords = {
+    portland: ['portland', 'self-care lodging', 'fisher house', 'best western', '503-220-8262'],
+    wrj: ['white river junction', 'vermont', 'wrj'],
+    slc_heart: ['heart transplant', 'lvad', 'residence inn']
+  };
+
+  let contractKey = null;
+  for (const [key, keywords] of Object.entries(contractKeywords)) {
+    if (keywords.some(k => combined.includes(k))) {
+      contractKey = key;
+      break;
     }
   }
 
-  // Keywords didn't match — send to Claude including PDF content and DOCX extracted text
+  // If attachment present and no emailType yet — it's a new reservation
+  const hasDocAttachment = attachmentNames.some(n => {
+    const l = n.toLowerCase();
+    return l.endsWith('.pdf') || l.endsWith('.docx') || l.endsWith('.doc');
+  });
+  if (!emailType && hasDocAttachment) emailType = 'new_reservation';
+
+  // If we have both from keywords — no Claude needed
+  if (emailType && contractKey) {
+    log(`✓ Classified via keywords: ${emailType} / ${contractKey}`);
+    return { emailType, contractKey };
+  }
+
+  // Single Claude call for both classification and contract ID
+  log('🤖 Calling Claude for classification + contract ID...');
+
   const messageContent = [];
 
-  // Build attachment context string for text attachments (including extracted DOCX)
-  let attachmentContext = '';
+  // Include PDF attachments
   for (const att of (attachments || [])) {
     if (att.type === 'document' && att.mediaType === 'application/pdf') {
-      log(`📎 Using PDF ${att.name} to identify contract`);
       messageContent.push({
         type: 'document',
         source: { type: 'base64', media_type: 'application/pdf', data: att.data }
       });
-    } else if (att.type === 'text' && att.content) {
-      log(`📎 Using extracted text from ${att.name} to identify contract`);
-      attachmentContext += `\n\n[Attachment: ${att.name}]\n${att.content.substring(0, 2000)}`;
     }
+  }
+
+  // Build attachment text context from DOCX
+  let attContext = '';
+  for (const att of (attachments || [])) {
+    if (att.type === 'text' && att.content) {
+      attContext += `\n\n[Attachment: ${att.name}]\n${att.content.substring(0, 2000)}`;
+    }
+  }
+
+  const reservationWords = ['reservation', 'lodging', 'check-in', 'check in', 'arrival', 'veteran', 'voucher', 'booking', 'hotel conf', 'ck in', 'ck out', 'name of veteran', 'date of arrival'];
+  if (!emailType) {
+    emailType = reservationWords.some(w => combined.includes(w)) ? 'new_reservation' : null;
   }
 
   messageContent.push({
     type: 'text',
-    text: `Which VA contract is this email for? Reply with ONLY one word: portland, wrj, slc_heart, hoptel, or unknown
+    text: `Analyze this VA lodging email and reply with ONLY a JSON object — no explanation:
+{"type": "new_reservation|cancellation|extension|update|other", "contract": "portland|wrj|slc_heart|hoptel|unknown"}
 
 Email subject: ${emailSubject}
-Email body: ${emailBody.substring(0, 500)}
-Attachment names: ${attachmentNames.join(', ')}${attachmentContext}
+Email body: ${emailBody.substring(0, 500)}${attContext}
 
-Contracts:
-- hoptel: Crystal Inn, West Valley, Hoptel, crystalinns.com — these are manual, reply hoptel to skip
-- portland: Portland Oregon VA Health Care System, Self-Care Lodging, Best Western, 503 area code, Christine Morgan, Fisher House, SW US Veterans Hospital
-- wrj: White River Junction Vermont VA Medical Center, 802 area code, Comfort Inn
-- slc_heart: Salt Lake City Heart Transplant or LVAD, Residence Inn, flight info, caregiver, hotel conf number in table format
-- unknown: cannot determine from any content
+Contract definitions:
+- portland: Portland Oregon VA, Self-Care Lodging, Best Western, 503 area code, SW US Veterans Hospital
+- wrj: White River Junction Vermont VA, 802 area code, Comfort Inn
+- slc_heart: Salt Lake City Heart Transplant or LVAD, Residence Inn, flight info
+- hoptel: Crystal Inn, West Valley, crystalinns — manual only
+- unknown: cannot determine
 
-IMPORTANT: If you see Crystal Inn or West Valley, reply hoptel even if email also mentions Salt Lake City.`
+Type definitions:
+- new_reservation: new booking
+- cancellation: cancelling stay
+- extension: extending checkout
+- update: changing details
+- other: not VA lodging related
+
+When in doubt on type, use new_reservation.`
   });
 
-  const result = await callClaude(
+  const text = await callClaude(
     [{ role: 'user', content: messageContent }],
-    'You identify which VA contract an email belongs to by reading the email and any attached documents. Reply with only one word: portland, wrj, slc_heart, or unknown.',
-    20
+    'You analyze VA lodging emails. Reply with only a JSON object with "type" and "contract" fields.',
+    100
   );
 
-  const r = result.trim().toLowerCase();
-  return ['portland', 'wrj', 'slc_heart'].includes(r) ? r : 'unknown';
+  try {
+    const clean = text.replace(/```json|```/g, '').trim();
+    const parsed = JSON.parse(clean);
+    const validTypes = ['new_reservation', 'cancellation', 'extension', 'update', 'other'];
+    const validContracts = ['portland', 'wrj', 'slc_heart', 'hoptel', 'unknown'];
+
+    return {
+      emailType: emailType || (validTypes.includes(parsed.type) ? parsed.type : 'new_reservation'),
+      contractKey: contractKey || (validContracts.includes(parsed.contract) ? parsed.contract : 'unknown')
+    };
+  } catch (e) {
+    log(`⚠ Could not parse classification response: ${text.substring(0, 100)}`);
+    return { emailType: emailType || 'new_reservation', contractKey: contractKey || 'unknown' };
+  }
 }
 
 async function extractReservations(emailSubject, emailBody, contractKey, attachments, emailType) {
@@ -566,11 +614,13 @@ async function processEmail(email) {
     }
   }
 
-  // Step 1: Classify email type
-  let emailType;
+  // Step 1 & 2 combined: Classify AND identify contract in one Claude call
+  let emailType, contractKey;
   try {
-    emailType = await classifyEmail(email.subject, cleanBody, attachmentNames);
-    log(`📋 Email type: ${emailType}`);
+    const classified = await classifyAndIdentify(email.subject, cleanBody, attachmentNames, processedAttachments);
+    emailType = classified.emailType;
+    contractKey = classified.contractKey;
+    log(`📋 Type: ${emailType} | Contract: ${contractKey}`);
   } catch (e) {
     log(`✗ Classification failed: ${e.message} — leaving UNREAD`);
     return;
@@ -581,27 +631,18 @@ async function processEmail(email) {
     return;
   }
 
-  // Step 2: Identify contract
-  let contractKey;
-  try {
-    contractKey = await identifyContract(email.subject, cleanBody, attachmentNames, processedAttachments);
-  } catch (e) {
-    log(`✗ Contract ID failed: ${e.message} — leaving UNREAD`);
+  // Hoptel is manual — leave unread for team to process
+  if (contractKey === 'hoptel' || CONTRACTS[contractKey]?.manualOnly) {
+    log(`📋 Hoptel/manual email: "${email.subject}" — leaving UNREAD for manual processing`);
     return;
   }
-
-  await new Promise(r => setTimeout(r, 3000)); // pause between Claude calls
 
   if (contractKey === 'unknown') {
     log(`⚠ Unknown contract: "${email.subject}" — leaving UNREAD for manual review`);
     return;
   }
 
-  // Hoptel is manual — leave unread for team to process
-  if (contractKey === 'hoptel' || CONTRACTS[contractKey]?.manualOnly) {
-    log(`📋 Hoptel/manual email: "${email.subject}" — leaving UNREAD for manual processing`);
-    return;
-  }
+  await new Promise(r => setTimeout(r, 3000)); // pause before extraction
 
   const contract = CONTRACTS[contractKey];
   log(`✓ Contract: ${contract.name}`);
@@ -768,7 +809,7 @@ app.get('/', (req, res) => {
   res.json({
     status: "Nova's Nests Email Agent running",
     mailbox: RESERVATIONS_EMAIL,
-    contracts: Object.keys(CONTRACTS),
+    contracts: Object.keys(CONTRACTS).filter(k => !CONTRACTS[k].manualOnly),
     time: new Date().toISOString()
   });
 });
@@ -777,6 +818,111 @@ app.post('/run-manual', async (req, res) => {
   res.json({ status: 'Manual check started' });
   log('▶ Manual run triggered');
   await pollEmails();
+});
+
+// ─── OAuth Setup Routes ───────────────────────────────────────────────────────
+// Visit /auth to start the OAuth flow and capture your refresh token
+
+app.get('/auth', (req, res) => {
+  const params = new URLSearchParams({
+    client_id: MS_CLIENT_ID,
+    response_type: 'code',
+    redirect_uri: `https://novas-nests-email-agent.onrender.com/auth/callback`,
+    scope: 'https://graph.microsoft.com/Mail.Read https://graph.microsoft.com/Mail.ReadWrite offline_access',
+    response_mode: 'query',
+    login_hint: RESERVATIONS_EMAIL
+  });
+
+  const authUrl = `https://login.microsoftonline.com/${MS_TENANT_ID}/oauth2/v2.0/authorize?${params}`;
+  log('▶ OAuth flow started — redirecting to Microsoft login');
+  res.redirect(authUrl);
+});
+
+app.get('/auth/callback', async (req, res) => {
+  const { code, error, error_description } = req.query;
+
+  if (error) {
+    log(`✗ OAuth error: ${error} — ${error_description}`);
+    return res.send(`
+      <h2 style="color:red;font-family:monospace">OAuth Error: ${error}</h2>
+      <p style="font-family:monospace">${error_description}</p>
+      <p style="font-family:monospace"><a href="/auth">Try again</a></p>
+    `);
+  }
+
+  if (!code) {
+    return res.send(`<p style="font-family:monospace">No code received. <a href="/auth">Try again</a></p>`);
+  }
+
+  try {
+    log('🔐 Exchanging auth code for refresh token...');
+
+    const resp = await fetch(
+      `https://login.microsoftonline.com/${MS_TENANT_ID}/oauth2/v2.0/token`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: new URLSearchParams({
+          client_id: MS_CLIENT_ID,
+          client_secret: MS_CLIENT_SECRET,
+          code,
+          redirect_uri: `https://novas-nests-email-agent.onrender.com/auth/callback`,
+          grant_type: 'authorization_code',
+          scope: 'https://graph.microsoft.com/Mail.Read https://graph.microsoft.com/Mail.ReadWrite offline_access'
+        })
+      }
+    );
+
+    const data = await resp.json();
+
+    if (!data.refresh_token) {
+      log(`✗ Token exchange failed: ${JSON.stringify(data)}`);
+      return res.send(`
+        <h2 style="color:red;font-family:monospace">Token exchange failed</h2>
+        <pre style="font-family:monospace">${JSON.stringify(data, null, 2)}</pre>
+        <p><a href="/auth">Try again</a></p>
+      `);
+    }
+
+    // Immediately use the new refresh token
+    currentRefreshToken = data.refresh_token;
+    log('✓ Refresh token captured and active — agent will now read encrypted attachments');
+
+    res.send(`
+      <!DOCTYPE html>
+      <html>
+      <head><style>
+        body { background:#0a1628; color:#f0f4ff; font-family:monospace; padding:40px; }
+        h1 { color:#c9a84c; letter-spacing:3px; }
+        .token { background:#050d1a; border:1px solid rgba(201,168,76,0.3); padding:16px; border-radius:6px; word-break:break-all; font-size:12px; margin:16px 0; }
+        .success { color:#2dd4a0; font-size:14px; margin-bottom:16px; }
+        .steps { color:#7a8ba8; line-height:2; font-size:12px; }
+        .steps b { color:#f0f4ff; }
+        .copy-btn { background:#c9a84c; color:#0a1628; border:none; padding:10px 20px; border-radius:4px; cursor:pointer; font-family:monospace; font-weight:bold; margin-top:8px; }
+      </style></head>
+      <body>
+        <h1>NOVA'S NESTS — OAUTH SETUP COMPLETE</h1>
+        <div class="success">✓ Refresh token captured successfully — agent is now using delegated auth</div>
+        <p style="color:#7a8ba8;font-size:12px;margin-bottom:8px;">Copy this token and add it to Render as MS_REFRESH_TOKEN:</p>
+        <div class="token" id="token">${data.refresh_token}</div>
+        <button class="copy-btn" onclick="navigator.clipboard.writeText(document.getElementById('token').textContent).then(()=>this.textContent='✓ COPIED')">COPY TOKEN</button>
+        <br><br>
+        <div class="steps">
+          <b>Add to Render:</b><br>
+          1. Go to render.com → novas-nests-email-agent → Environment<br>
+          2. Add variable: <b>MS_REFRESH_TOKEN</b><br>
+          3. Paste the token above<br>
+          4. Click Save Changes<br>
+          5. Done — encrypted attachments now work permanently
+        </div>
+      </body>
+      </html>
+    `);
+
+  } catch (e) {
+    log(`✗ OAuth callback error: ${e.message}`);
+    res.send(`<h2 style="color:red;font-family:monospace">Error: ${e.message}</h2><p><a href="/auth">Try again</a></p>`);
+  }
 });
 
 // ─── Start ────────────────────────────────────────────────────────────────────
