@@ -1,4 +1,5 @@
 const express = require('express');
+const mammoth = require('mammoth');
 const app = express();
 app.use(express.json());
 
@@ -132,16 +133,33 @@ async function markEmailAsRead(emailId) {
 
 // ─── Attachment extraction ────────────────────────────────────────────────────
 
-function extractTextFromAttachment(att) {
+async function extractTextFromAttachment(att) {
   const name = (att.name || '').toLowerCase();
-  if (att.contentBytes) {
-    const mediaType = name.endsWith('.pdf') ? 'application/pdf'
-      : (name.endsWith('.docx') || name.endsWith('.doc'))
-        ? 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
-        : null;
-    if (mediaType) return { type: 'document', mediaType, data: att.contentBytes, name: att.name };
+
+  // PDF — send as native document to Claude
+  if (att.contentBytes && name.endsWith('.pdf')) {
+    return { type: 'document', mediaType: 'application/pdf', data: att.contentBytes, name: att.name };
   }
-  if (att.body?.content) return { type: 'text', content: att.body.content, name: att.name };
+
+  // DOCX/DOC — extract raw text using mammoth then send as plain text to Claude
+  if (att.contentBytes && (name.endsWith('.docx') || name.endsWith('.doc'))) {
+    try {
+      const buffer = Buffer.from(att.contentBytes, 'base64');
+      const result = await mammoth.extractRawText({ buffer });
+      const text = result.value || '';
+      log(`📎 Extracted ${text.length} chars from Word doc: ${att.name}`);
+      return { type: 'text', content: text, name: att.name };
+    } catch (e) {
+      log(`⚠ Could not extract text from ${att.name}: ${e.message}`);
+      return { type: 'text', content: `[Word document: ${att.name} — could not extract text]`, name: att.name };
+    }
+  }
+
+  // Plain text/HTML body
+  if (att.body?.content) {
+    return { type: 'text', content: att.body.content, name: att.name };
+  }
+
   return null;
 }
 
@@ -224,17 +242,21 @@ async function identifyContract(emailSubject, emailBody, attachmentNames, attach
     }
   }
 
-  // Keywords didn't match — send to Claude including attachment content so it can read the doc
+  // Keywords didn't match — send to Claude including PDF content and DOCX extracted text
   const messageContent = [];
 
-  // Include document attachments for Claude to read and identify contract
+  // Build attachment context string for text attachments (including extracted DOCX)
+  let attachmentContext = '';
   for (const att of (attachments || [])) {
-    if (att.type === 'document') {
-      log(`📎 Using ${att.name} to identify contract`);
+    if (att.type === 'document' && att.mediaType === 'application/pdf') {
+      log(`📎 Using PDF ${att.name} to identify contract`);
       messageContent.push({
         type: 'document',
-        source: { type: 'base64', media_type: att.mediaType, data: att.data }
+        source: { type: 'base64', media_type: 'application/pdf', data: att.data }
       });
+    } else if (att.type === 'text' && att.content) {
+      log(`📎 Using extracted text from ${att.name} to identify contract`);
+      attachmentContext += `\n\n[Attachment: ${att.name}]\n${att.content.substring(0, 2000)}`;
     }
   }
 
@@ -244,7 +266,7 @@ async function identifyContract(emailSubject, emailBody, attachmentNames, attach
 
 Email subject: ${emailSubject}
 Email body: ${emailBody.substring(0, 500)}
-Attachment names: ${attachmentNames.join(', ')}
+Attachment names: ${attachmentNames.join(', ')}${attachmentContext}
 
 Contracts:
 - portland: Portland Oregon VA Health Care System, Self-Care Lodging, Best Western, 503 area code, Christine Morgan, Fisher House, SW US Veterans Hospital
@@ -299,21 +321,25 @@ Rules:
 
   const messageContent = [];
 
-  // Include document attachments
+  // Include PDF attachments as native documents and DOCX as extracted text
+  let attachmentTextContext = '';
   for (const att of attachments) {
-    if (att.type === 'document') {
-      log(`📎 Sending ${att.name} to Claude as document`);
+    if (att.type === 'document' && att.mediaType === 'application/pdf') {
+      log(`📎 Sending PDF ${att.name} to Claude`);
       messageContent.push({
         type: 'document',
-        source: { type: 'base64', media_type: att.mediaType, data: att.data }
+        source: { type: 'base64', media_type: 'application/pdf', data: att.data }
       });
+    } else if (att.type === 'text' && att.content) {
+      log(`📎 Including extracted text from ${att.name}`);
+      attachmentTextContext += `\n\n[Document: ${att.name}]\n${att.content.substring(0, 3000)}`;
     }
   }
 
   const cleanBody = emailBody.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
   messageContent.push({
     type: 'text',
-    text: `Subject: ${emailSubject}\n\nBody:\n${cleanBody.substring(0, 3000)}\n\nExtract all VA reservations.`
+    text: `Subject: ${emailSubject}\n\nEmail body:\n${cleanBody.substring(0, 2000)}${attachmentTextContext}\n\nExtract all VA reservations from the above content.`
   });
 
   const text = await callClaude(
@@ -518,7 +544,7 @@ async function processEmail(email) {
       const attachments = await getEmailAttachments(email.id);
       attachmentNames = attachments.map(a => a.name || '');
       for (const att of attachments) {
-        const extracted = extractTextFromAttachment(att);
+        const extracted = await extractTextFromAttachment(att);
         if (extracted) {
           processedAttachments.push(extracted);
           log(`📎 Attachment: ${att.name} (${extracted.type})`);
