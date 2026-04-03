@@ -14,6 +14,17 @@ const RESERVATIONS_EMAIL = 'reservations@novasnestsgov.com';
 // ─── Contract Configuration ───────────────────────────────────────────────────
 
 const CONTRACTS = {
+  // Hoptel must be FIRST so crystal inn/west valley keywords match before slc_heart's 'slc' keyword
+  hoptel: {
+    name: 'Hoptel SLC',
+    boardId: null,
+    vaLocation: null,
+    keywords: ['crystal inn', 'hoptel', 'west valley', 'offsite va master', 'crystalinns.com'],
+    notifiedColumnId: null,
+    hotel: null,
+    statusColumnId: null,
+    manualOnly: true
+  },
   portland: {
     name: 'Portland VA Contract',
     boardId: '18406634526',
@@ -36,13 +47,12 @@ const CONTRACTS = {
     name: 'Heart Transplant SLC VA Contract',
     boardId: '18406339737',
     vaLocation: 'Salt Lake City VA Medical Center',
-    keywords: ['heart transplant', 'lvad', 'residence inn', 'salt lake', 'slc'],
+    // Removed 'salt lake', 'slc' — too generic, causes false matches with Crystal Inn emails
+    keywords: ['heart transplant', 'lvad', 'residence inn'],
     notifiedColumnId: null,
     hotel: 'Residence Inn',
     statusColumnId: 'color_mm1d6vgs'
-  },
-  // Hoptel SLC is handled manually — Excel spreadsheet workflow
-  // not compatible with automated item creation. Team processes manually.
+  }
 };
 
 // Shared Monday column IDs
@@ -262,19 +272,20 @@ async function identifyContract(emailSubject, emailBody, attachmentNames, attach
 
   messageContent.push({
     type: 'text',
-    text: `Which VA contract is this email for? Reply with ONLY one word: portland, wrj, slc_heart, or unknown
+    text: `Which VA contract is this email for? Reply with ONLY one word: portland, wrj, slc_heart, hoptel, or unknown
 
 Email subject: ${emailSubject}
 Email body: ${emailBody.substring(0, 500)}
 Attachment names: ${attachmentNames.join(', ')}${attachmentContext}
 
 Contracts:
+- hoptel: Crystal Inn, West Valley, Hoptel, crystalinns.com — these are manual, reply hoptel to skip
 - portland: Portland Oregon VA Health Care System, Self-Care Lodging, Best Western, 503 area code, Christine Morgan, Fisher House, SW US Veterans Hospital
 - wrj: White River Junction Vermont VA Medical Center, 802 area code, Comfort Inn
 - slc_heart: Salt Lake City Heart Transplant or LVAD, Residence Inn, flight info, caregiver, hotel conf number in table format
 - unknown: cannot determine from any content
 
-Read any attached documents carefully to identify which VA facility and contract this belongs to.`
+IMPORTANT: If you see Crystal Inn or West Valley, reply hoptel even if email also mentions Salt Lake City.`
   });
 
   const result = await callClaude(
@@ -587,8 +598,8 @@ async function processEmail(email) {
   }
 
   // Hoptel is manual — leave unread for team to process
-  if (contractKey === 'hoptel') {
-    log(`📋 Hoptel SLC email detected: "${email.subject}" — leaving UNREAD for manual processing`);
+  if (contractKey === 'hoptel' || CONTRACTS[contractKey]?.manualOnly) {
+    log(`📋 Hoptel/manual email: "${email.subject}" — leaving UNREAD for manual processing`);
     return;
   }
 
