@@ -166,6 +166,26 @@ async function markEmailAsRead(emailId) {
   );
 }
 
+async function flagAndMarkRead(emailId, reason) {
+  // Flag the email for manual review AND mark as read in one call
+  // This stops the agent from ever retrying it while alerting your team
+  const token = await getMSToken();
+  await fetch(
+    `https://graph.microsoft.com/v1.0/me/messages/${emailId}`,
+    {
+      method: 'PATCH',
+      headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        isRead: true,
+        flag: {
+          flagStatus: 'flagged'
+        }
+      })
+    }
+  );
+  log(`🚩 Email flagged for manual review — reason: ${reason}`);
+}
+
 // ─── Attachment extraction ────────────────────────────────────────────────────
 
 async function extractTextFromAttachment(att) {
@@ -632,23 +652,27 @@ async function processEmail(email) {
     contractKey = classified.contractKey;
     log(`📋 Type: ${emailType} | Contract: ${contractKey}`);
   } catch (e) {
-    log(`✗ Classification failed: ${e.message} — leaving UNREAD`);
+    log(`✗ Classification failed: ${e.message}`);
+    await flagAndMarkRead(email.id, `Classification error: ${e.message}`);
     return;
   }
 
   if (emailType === 'other') {
-    log(`ℹ Not a reservation email — leaving UNREAD for manual review`);
+    log(`ℹ Not a reservation email — flagging for manual review`);
+    await flagAndMarkRead(email.id, 'Not identified as a VA reservation email');
     return;
   }
 
-  // Hoptel is manual — leave unread for team to process
+  // Hoptel is manual — flag and mark read
   if (contractKey === 'hoptel' || CONTRACTS[contractKey]?.manualOnly) {
-    log(`📋 Hoptel/manual email: "${email.subject}" — leaving UNREAD for manual processing`);
+    log(`📋 Hoptel email: "${email.subject}" — flagging for manual processing`);
+    await flagAndMarkRead(email.id, 'Hoptel SLC — manual processing required');
     return;
   }
 
   if (contractKey === 'unknown') {
-    log(`⚠ Unknown contract: "${email.subject}" — leaving UNREAD for manual review`);
+    log(`⚠ Unknown contract: "${email.subject}" — flagging for manual review`);
+    await flagAndMarkRead(email.id, 'Could not identify VA contract');
     return;
   }
 
@@ -663,12 +687,14 @@ async function processEmail(email) {
     log(`🤖 Extracting with Claude (${emailType})...`);
     reservations = await extractReservations(email.subject, cleanBody, contractKey, processedAttachments, emailType);
   } catch (e) {
-    log(`✗ Extraction failed: ${e.message} — leaving UNREAD`);
+    log(`✗ Extraction failed: ${e.message}`);
+    await flagAndMarkRead(email.id, `Extraction error: ${e.message}`);
     return;
   }
 
   if (reservations.length === 0) {
-    log(`⚠ No reservations extracted — leaving UNREAD for manual review`);
+    log(`⚠ No reservations extracted — flagging for manual review`);
+    await flagAndMarkRead(email.id, 'Claude could not extract reservation data — check attachment or email format');
     return;
   }
 
@@ -772,9 +798,10 @@ async function processEmail(email) {
     }
   }
 
-  // Only mark as read if something succeeded
+  // Flag and mark read if everything failed — stops retrying
   if (failed > 0 && created === 0 && updated === 0 && cancelled === 0) {
-    log(`✗ Nothing succeeded — leaving email UNREAD for manual review`);
+    log(`✗ All Monday creates failed — flagging for manual review`);
+    await flagAndMarkRead(email.id, 'Monday item creation failed — check Render logs');
     return;
   }
 
