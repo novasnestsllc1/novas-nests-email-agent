@@ -622,7 +622,30 @@ async function processEmail(email) {
   log(`📧 Processing: "${email.subject}" from ${email.from?.emailAddress?.address}`);
 
   const emailBody = email.body?.content || '';
-  const cleanBody = emailBody.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
+
+  // Improved HTML cleaning — preserve table structure by converting to readable text
+  let cleanBody = emailBody
+    // Convert table rows to newlines to preserve structure
+    .replace(/<\/tr>/gi, '\n')
+    .replace(/<\/td>/gi, ' | ')
+    .replace(/<\/th>/gi, ' | ')
+    .replace(/<br\s*\/?>/gi, '\n')
+    .replace(/<\/p>/gi, '\n')
+    .replace(/<\/div>/gi, '\n')
+    // Strip remaining HTML tags
+    .replace(/<[^>]+>/g, '')
+    // Decode HTML entities
+    .replace(/&amp;/g, '&')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&nbsp;/g, ' ')
+    .replace(/&#160;/g, ' ')
+    // Clean up whitespace but preserve newlines
+    .replace(/[ \t]+/g, ' ')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+
+  log(`📧 Body length: ${cleanBody.length} chars`);
 
   // Get attachments
   let processedAttachments = [];
@@ -684,7 +707,10 @@ async function processEmail(email) {
   // Step 3: Extract reservation data
   let reservations = [];
   try {
-    log(`🤖 Extracting with Claude (${emailType})...`);
+    log(`🤖 Extracting with Claude (${emailType}) — body: ${cleanBody.length} chars, attachments: ${processedAttachments.length}`);
+    if (cleanBody.length < 50 && processedAttachments.length === 0) {
+      log(`⚠ Email body is very short (${cleanBody.length} chars) and no attachments — likely encrypted body`);
+    }
     reservations = await extractReservations(email.subject, cleanBody, contractKey, processedAttachments, emailType);
   } catch (e) {
     log(`✗ Extraction failed: ${e.message}`);
