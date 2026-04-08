@@ -1,5 +1,6 @@
 const express = require('express');
 const mammoth = require('mammoth');
+const XLSX = require('xlsx');
 const app = express();
 app.use(express.json());
 
@@ -17,13 +18,31 @@ const CONTRACTS = {
   // Hoptel must be FIRST so crystal inn/west valley keywords match before slc_heart's 'slc' keyword
   hoptel: {
     name: 'Hoptel SLC',
-    boardId: null,
-    vaLocation: null,
+    boardId: '18407764258',
+    vaLocation: 'Salt Lake City VA Medical Center',
     keywords: ['crystal inn', 'hoptel', 'west valley', 'offsite va master', 'crystalinns.com'],
     notifiedColumnId: null,
     hotel: null,
-    statusColumnId: null,
-    manualOnly: true
+    statusColumnId: 'color_mm27ywsm',
+    manualOnly: false,  // ← change this to false
+    // Hoptel-specific column IDs
+    cols: {
+      hotelName:    'color_mm27wqn1',
+      status:       'color_mm27ywsm',
+      checkin:      'date_mm27f0bk',
+      checkout:     'date_mm27pjmd',
+      nights:       'numeric_mm27n3m8',
+      confirm:      'text_mm27ra9h',
+      billingRate:  'numeric_mm27kx8m',
+      totalBilled:  'numeric_mm27s0h6',
+      hotelCost:    'numeric_mm27nfgf',
+      totalCost:    'numeric_mm27ykq3',
+      profitNight:  'numeric_mm27f7w3',
+      totalProfit:  'numeric_mm278s8y',
+      authorizedBy: 'color_mm2796fr',
+      notes:        'long_text_mm273xnx',
+      invoiceMonth: 'text_mm27xt1k'
+    }
   },
   portland: {
     name: 'Portland VA Contract',
@@ -615,7 +634,140 @@ async function updateMondayItem(boardId, itemId, reservation, veteranName) {
   log(`✓ Updated ${veteranName} reservation (item ${itemId})`);
   return result?.data?.change_multiple_column_values;
 }
+// ─── Hoptel Spreadsheet Parser ────────────────────────────────────────────────
 
+function parseHoptelSpreadsheet(buffer, filename) {
+  const workbook = XLSX.read(buffer, { type: 'buffer', cellDates: true });
+  
+  // Determine location from filename
+  const isWestValley = filename.toLowerCase().includes('west valley') || 
+                       filename.toLowerCase().includes('west_valley');
+  const location = isWestValley ? 'Crystal Inn West Valley' : 'Crystal Inn SLC';
+  const groupId = isWestValley ? 'group_mm275sdz' : 'group_mm27c6kr';
+  
+  // Rates
+  const hotelCost = isWestValley ? 132.23 : 132.80;
+  const billingRate = 138.72;
+  const profitPerNight = parseFloat((billingRate - hotelCost).toFixed(2));
+
+  const validBookings = [];
+  const flaggedRows = [];
+
+  // Process current month sheet only (first sheet with actual data)
+  const sheetName = workbook.SheetNames[0];
+  const sheet = workbook.Sheets[sheetName];
+  const rows = XLSX.utils.sheet_to_json(sheet, { header: 1, defval: null });
+
+  // Data starts at row index 14 (0-based)
+  for (let i = 14; i < rows.length; i++) {
+    const row = rows[i];
+    if (!row || row.length < 10) continue;
+
+    const confNum  = row[1];
+    const name     = row[5];
+    const checkinRaw  = row[6];
+    const checkoutRaw = row[7];
+    const nights   = row[9];
+    const authBy   = row[12];
+    const noshow   = row[15];
+
+    // Skip empty slots — no name means unused room slot
+    if (!name || String(name).trim() === '') continue;
+
+    // Skip no-shows and cancellations
+    if (noshow && String(noshow).trim() !== '') continue;
+
+    const nameClean = String(name).trim();
+    const confClean = confNum ? String(confNum).trim() : null;
+
+    // Parse dates
+    const checkin  = parseHoptelDate(checkinRaw);
+    const checkout = parseHoptelDate(checkoutRaw);
+
+    // Flag rows with a name but bad dates
+    if (!checkin || !checkout) {
+      flaggedRows.push({
+        name: nameClean,
+        confNum: confClean,
+        checkinRaw: checkinRaw,
+        checkoutRaw: checkoutRaw,
+        row: i + 1,
+        sheet: sheetName,
+        file: filename
+      });
+      continue;
+    }
+
+    // Additional sanity checks — flag logically impossible dates
+    const checkinDate  = new Date(checkin);
+    const checkoutDate = new Date(checkout);
+    const nightsCalc   = Math.round((checkoutDate - checkinDate) / (1000 * 60 * 60 * 24));
+
+    if (checkoutDate <= checkinDate) {
+      flaggedRows.push({
+        name: nameClean,
+        confNum: confClean,
+        checkinRaw,
+        checkoutRaw,
+        row: i + 1,
+        sheet: sheetName,
+        file: filename,
+        reason: 'Checkout is not after check-in'
+      });
+      continue;
+    }
+
+    const nightsActual = nights ? parseInt(nights) : nightsCalc;
+
+    validBookings.push({
+      location,
+      groupId,
+      confNum: confClean,
+      name: nameClean,
+      checkin,
+      checkout,
+      nights: nightsActual,
+      authBy: authBy ? String(authBy).trim() : null,
+      hotelCost,
+      billingRate,
+      profitPerNight,
+      totalHotelCost: parseFloat((hotelCost * nightsActual).toFixed(2)),
+      totalBilled: parseFloat((billingRate * nightsActual).toFixed(2)),
+      totalProfit: parseFloat((profitPerNight * nightsActual).toFixed(2))
+    });
+  }
+
+  log(`📊 ${filename}: ${validBookings.length} valid bookings, ${flaggedRows.length} flagged rows`);
+  return { validBookings, flaggedRows, location };
+}
+
+function parseHoptelDate(val) {
+  if (!val) return null;
+
+  // Already a JS Date object (xlsx parsed it)
+  if (val instanceof Date) {
+    if (isNaN(val.getTime())) return null;
+    return val.toISOString().split('T')[0];
+  }
+
+  const str = String(val).trim();
+  if (!str) return null;
+
+  // MM.DD.YY or MM.DD.YYYY
+  const dotMatch = str.match(/^(\d{1,2})\.(\d{1,2})\.(\d{2,4})$/);
+  if (dotMatch) {
+    let [_, m, d, y] = dotMatch;
+    if (y.length === 2) y = '20' + y;
+    const date = new Date(`${y}-${m.padStart(2,'0')}-${d.padStart(2,'0')}`);
+    if (!isNaN(date.getTime())) return date.toISOString().split('T')[0];
+  }
+
+  // ISO format
+  const isoMatch = str.match(/^(\d{4}-\d{2}-\d{2})/);
+  if (isoMatch) return isoMatch[1];
+
+  return null;
+}
 // ─── Main email processor ─────────────────────────────────────────────────────
 
 async function processEmail(email) {
@@ -687,9 +839,130 @@ async function processEmail(email) {
   }
 
   // Hoptel is manual — flag and mark read
-  if (contractKey === 'hoptel' || CONTRACTS[contractKey]?.manualOnly) {
-    log(`📋 Hoptel email: "${email.subject}" — flagging for manual processing`);
-    await flagAndMarkRead(email.id, 'Hoptel SLC — manual processing required');
+  // ── HOPTEL SPREADSHEET ────────────────────────────────────────────────────
+  if (contractKey === 'hoptel') {
+    // Find xlsx attachments
+    const xlsxAtts = email.hasAttachments ? 
+      (await getEmailAttachments(email.id)).filter(a => 
+        (a.name || '').toLowerCase().endsWith('.xlsx')
+      ) : [];
+
+    if (xlsxAtts.length === 0) {
+      log(`📋 Hoptel email has no xlsx — flagging for manual review`);
+      await flagAndMarkRead(email.id, 'Hoptel email with no xlsx attachment');
+      return;
+    }
+
+    const contract = CONTRACTS.hoptel;
+    let totalCreated = 0;
+    let totalFlagged = [];
+
+    for (const att of xlsxAtts) {
+      const buffer = Buffer.from(att.contentBytes, 'base64');
+      const { validBookings, flaggedRows, location } = parseHoptelSpreadsheet(buffer, att.name);
+
+      // Push each valid booking to Monday — deduplicate on confirmation number
+      for (const booking of validBookings) {
+        try {
+          // Check if confirmation number already exists on the board
+          if (booking.confNum) {
+            const existing = await mondayQuery(`
+              query {
+                boards(ids: [${contract.boardId}]) {
+                  items_page(limit: 500) {
+                    items {
+                      id
+                      column_values(ids: ["${contract.cols.confirm}"]) { text }
+                    }
+                  }
+                }
+              }
+            `);
+            const items = existing?.data?.boards?.[0]?.items_page?.items || [];
+            const duplicate = items.find(item =>
+              item.column_values?.[0]?.text === booking.confNum
+            );
+            if (duplicate) {
+              log(`⏭ Duplicate conf# ${booking.confNum} (${booking.name}) — skipping`);
+              continue;
+            }
+          }
+
+          // Get invoice month from check-in date
+          const invoiceMonth = booking.checkin ? 
+            new Date(booking.checkin + 'T12:00:00').toLocaleString('en-US', { month: 'long', year: 'numeric' }) : null;
+
+          const colValues = {
+            [contract.cols.status]:       { label: 'Working on it' },
+            [contract.cols.hotelName]:    { label: location },
+            [contract.cols.checkin]:      { date: booking.checkin },
+            [contract.cols.checkout]:     { date: booking.checkout },
+            [contract.cols.nights]:       booking.nights,
+            [contract.cols.billingRate]:  booking.billingRate,
+            [contract.cols.totalBilled]:  booking.totalBilled,
+            [contract.cols.hotelCost]:    booking.hotelCost,
+            [contract.cols.totalCost]:    booking.totalHotelCost,
+            [contract.cols.profitNight]:  booking.profitPerNight,
+            [contract.cols.totalProfit]:  booking.totalProfit,
+          };
+
+          if (booking.confNum)    colValues[contract.cols.confirm]      = booking.confNum;
+          if (booking.authBy)     colValues[contract.cols.authorizedBy]  = { label: booking.authBy };
+          if (invoiceMonth)       colValues[contract.cols.invoiceMonth]  = invoiceMonth;
+
+          const mutation = `
+            mutation {
+              create_item(
+                board_id: ${contract.boardId},
+                group_id: "${booking.groupId}",
+                item_name: "${booking.name.replace(/"/g, '\\"')}",
+                column_values: ${JSON.stringify(JSON.stringify(colValues))}
+              ) { id name }
+            }
+          `;
+          const result = await mondayQuery(mutation);
+          const item = result?.data?.create_item;
+          if (item) {
+            log(`✓ Hoptel created: ${item.name} (${item.id}) — ${location} conf#${booking.confNum}`);
+            totalCreated++;
+          }
+
+          await new Promise(r => setTimeout(r, 300)); // small pause between creates
+
+        } catch (e) {
+          log(`✗ Hoptel Monday create error for ${booking.name}: ${e.message}`);
+        }
+      }
+
+      totalFlagged.push(...flaggedRows);
+    }
+
+    // Send flagged rows summary email if any
+    if (totalFlagged.length > 0) {
+      log(`⚠ Sending flagged rows summary — ${totalFlagged.length} rows need review`);
+      const flagLines = totalFlagged.map(f =>
+        `• ${f.name} | Conf#: ${f.confNum || 'N/A'} | Check-in: "${f.checkinRaw}" | Check-out: "${f.checkoutRaw}" | File: ${f.file} | Row: ${f.row}${f.reason ? ' | Reason: ' + f.reason : ''}`
+      ).join('\n');
+
+      const token = await getMSToken();
+      await fetch('https://graph.microsoft.com/v1.0/me/sendMail', {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          message: {
+            subject: `⚠ Hoptel SLC — ${totalFlagged.length} booking(s) could not be imported`,
+            body: {
+              contentType: 'Text',
+              content: `The following veterans were in the Crystal Inn spreadsheet but could not be imported due to date errors. Please correct the spreadsheet and the agent will pick them up on the next send.\n\n${flagLines}\n\n— Nova's Nests Email Agent`
+            },
+            toRecipients: [{ emailAddress: { address: 'reservations@novasnestsgov.com' } }]
+          }
+        })
+      });
+    }
+
+    log(`✓ Hoptel complete — ${totalCreated} created, ${totalFlagged.length} flagged`);
+    await markEmailAsRead(email.id);
     return;
   }
 
